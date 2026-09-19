@@ -6,10 +6,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .alignment import align
 from .segmenter import Config, solve
 from .terminology import TermError, review_terms
 
-app = FastAPI(title="字幕断句", version="1.4.0")
+app = FastAPI(title="字幕断句", version="1.5.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -64,6 +65,13 @@ class ReviewRequest(BaseModel):
     terms: list[TermIn] = Field(default_factory=list)
 
 
+class AlignRequest(BaseModel):
+    """对当前选中的断句方案与按行译文做单调 DP 对齐(1:1 / 1:2 / 2:1)。"""
+    words: list[WordIn]
+    segments: list[ReviewSegmentIn]
+    translation: str = ""
+
+
 @app.post("/api/segment")
 def segment(req: SegmentRequest):
     cfg_fields = {k: v for k, v in req.config.items() if k in Config.__dataclass_fields__}
@@ -87,6 +95,18 @@ def terms_review(req: ReviewRequest):
         )
     except TermError as e:
         raise HTTPException(status_code=422, detail=e.payload)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/align")
+def align_translation(req: AlignRequest):
+    try:
+        return align(
+            [w.model_dump() for w in req.words],
+            [s.model_dump() for s in req.segments],
+            req.translation,
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

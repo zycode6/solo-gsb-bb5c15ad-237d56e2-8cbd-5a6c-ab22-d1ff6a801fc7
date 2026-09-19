@@ -105,6 +105,19 @@
   .trlist .ar { color:var(--ok); font-weight:600; }
   .seg.flash { animation:segflash 1.4s ease; }
   @keyframes segflash { 0%, 60% { box-shadow:0 0 0 2px var(--accent) inset; } 100% { box-shadow:0 0 0 0 transparent inset; } }
+  /* 译文对齐 */
+  .aligngroup { background:#101216; border:1px solid var(--border); border-radius:8px; padding:9px 12px; margin-bottom:9px; }
+  .aligngroup .ameta { font-size:11px; color:var(--dim); margin-bottom:5px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .aligngroup .atype { font-weight:600; color:var(--accent); border:1px solid var(--accent); border-radius:4px; padding:0 6px; }
+  .aligngroup .atype.t12 { color:#f5a524; border-color:#f5a524; }
+  .aligngroup .atype.t21 { color:var(--ph); border-color:var(--ph); }
+  .aligngroup .apair { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+  @media (max-width: 900px) { .aligngroup .apair { grid-template-columns: 1fr; } }
+  .aligngroup .aside { background:#000; border-radius:4px; padding:4px 9px; font-size:14px; line-height:1.45; }
+  .aligngroup .aside.src { color:#fff; }
+  .aligngroup .aside.tgt { color:#bfe0ff; }
+  .aligngroup .aside .idx { display:block; font-size:10px; color:var(--dim); margin-bottom:1px; }
+  .alignwarn { border:1px solid #f5a524; background:#2b2410; color:#f5c66a; border-radius:8px; padding:10px 12px; font-size:13px; white-space:pre-wrap; }
 </style>
 </head>
 <body>
@@ -189,6 +202,20 @@
       <h2>断句预览</h2>
       <div class="hint" style="margin-bottom:8px">点击段落右上角 <b>🔒 锁定</b> 可固定该段的词范围与内部换行;之后调整权重、边界约束或备选数量时,后端只优化其余区间,跨区间的 K-best 组合仍按全局总代价排序、按完整断点序列去重。再次点击可解锁。</div>
       <div id="result"><span class="hint">粘贴词序列后自动计算。</span></div>
+    </div>
+
+    <div class="panel">
+      <h2>译文对齐(当前选中方案)</h2>
+      <textarea id="translation" rows="7" spellcheck="false" placeholder="每行一条译文,与源字幕段大致对应
+First line of translation
+Second line ..."></textarea>
+      <div class="hint">按行粘贴译文(空行自动忽略)。对当前选中的断句方案做单调动态规划:允许 <b>1:1</b>、<b>1:2</b>(一个源段对应两行译文)、<b>2:1</b>(两个相邻源段对应一行译文),每组代价为两侧去空白字符占各自全文字符数的比例差绝对值,句末标点类别(句号/问号/叹号/无)不一致再加 0.15;取总成本最小的完整覆盖,同分依次优先 1:1、较早结束的路径。源方案或译文变化后自动重算。</div>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" id="fillTransExample" type="button">填入示例译文</button>
+        <button type="button" id="downloadSrt" style="margin-left:auto;display:none">下载双语 SRT</button>
+      </div>
+      <div class="error" id="alignMsg"></div>
+      <div id="alignResult" style="margin-top:10px"></div>
     </div>
   </div>
 </main>
@@ -363,6 +390,7 @@ $("result").addEventListener("click", e => {
       clearReview();
       renderPlan(i);
       scheduleReview();
+      scheduleAlign();
     }
     return;
   }
@@ -397,6 +425,7 @@ async function run() {
     $("parseError").textContent = e.message;
     $("result").innerHTML = "";
     renderWordFlow([], []);
+    clearAlignment("词序列无法解析,请先修正输入。");
     return;
   }
   // 短语/切点解析失败时保留词序列与边界标记,仅提示错误
@@ -408,7 +437,7 @@ async function run() {
     $("parseError").textContent = e.message;
   }
   renderWordFlow(words, phrases);
-  if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; clearReview(); return; }
+  if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; clearReview(); clearAlignment("当前没有可用的断句方案。"); return; }
   lastWords = words;
 
   const cfg = {};
@@ -436,11 +465,13 @@ async function run() {
   const data = await res.json();
   if (!res.ok) {
     clearReview();
+    clearAlignment("当前断句方案不可用(无可行分段或请求失败),请先修正输入。");
     $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`;
     return;
   }
   render(data);
   scheduleReview();
+  scheduleAlign();
 }
 
 // 当前响应与选中的方案名次
@@ -502,6 +533,7 @@ function render(data) {
   const el = $("result");
   if (!data.ok) {
     clearReview();
+    clearAlignment("当前断句方案无可行分段,译文对齐暂不可用;调整输入得到可行方案后自动重算。");
     clearBreakMarks();
     const c = data.conflict;
     const b = c.boundary;
@@ -673,6 +705,130 @@ function clearReview(message) {
   $("reviewPanel").style.display = "none";
   $("reviewError").textContent = message || "";
 }
+
+// ── 译文对齐 ──
+let alignData = null;       // 最近一次成功的对齐响应
+let alignRunId = 0;
+let alignTimer = null;
+
+function clearAlignment(message, warn) {
+  alignData = null;
+  $("downloadSrt").style.display = "none";
+  $("alignResult").innerHTML = "";
+  const msg = $("alignMsg");
+  msg.textContent = message || "";
+  msg.className = warn ? "alignwarn" : "error";
+}
+
+function scheduleAlign() {
+  clearTimeout(alignTimer);
+  alignTimer = setTimeout(runAlign, 300);
+}
+
+async function runAlign() {
+  const runId = ++alignRunId;
+  const segments = currentSegments();
+  const translation = $("translation").value;
+  const hasLines = translation.split(/\r?\n/).some(l => l.trim());
+  if (!segments || !segments.length) {
+    clearAlignment("当前没有可用的断句方案。");
+    return;
+  }
+  if (!hasLines) {
+    clearAlignment("请按行粘贴译文(每行一条,空行忽略);输入译文后自动对齐。");
+    return;
+  }
+  const res = await fetch("/api/align", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      words: lastWords,
+      segments: segments.map(s => ({ word_range: s.word_range, line_break: s.line_break })),
+      translation,
+    }),
+  });
+  const data = await res.json();
+  if (runId !== alignRunId) return;  // 已有更新的对齐请求, 丢弃过期响应
+  if (!res.ok) {
+    clearAlignment(String(data.detail || "对齐请求失败"));
+    return;
+  }
+  if (!data.ok) {
+    // 任一侧为空或无法完整覆盖: 保留输入, 提示首个未覆盖位置
+    renderAlignGroups(null);
+    clearAlignment(data.message || "无法完整覆盖,请调整译文行数或断句方案。", true);
+    return;
+  }
+  $("alignMsg").textContent = "";
+  alignData = data;
+  renderAlignGroups(data);
+}
+
+function renderAlignGroups(data) {
+  alignData = data;
+  $("downloadSrt").style.display = data ? "" : "none";
+  const el = $("alignResult");
+  if (!data) { el.innerHTML = ""; return; }
+  const ones = data.groups.filter(g => g.type === "1:1").length;
+  const head = `<div class="total">源段 <b>${data.source_count}</b> · 译行 <b>${data.target_count}</b> ·
+    对齐组 <b>${data.groups.length}</b>(1:1 × ${ones})· 总代价 <b>${data.total_cost}</b></div>`;
+  el.innerHTML = head + data.groups.map(g => {
+    const cls = g.type === "1:2" ? " t12" : g.type === "2:1" ? " t21" : "";
+    const smap = g.source.segments[0] === g.source.segments[1]
+      ? `源段 ${g.source.segments[0]}`
+      : `源段 ${g.source.segments[0]}–${g.source.segments[1]}`;
+    const tmap = g.target.lines[0] === g.target.lines[1]
+      ? `译行 ${g.target.lines[0]}`
+      : `译行 ${g.target.lines[0]}–${g.target.lines[1]}`;
+    return `<div class="aligngroup">
+      <div class="ameta"><span>#${g.index + 1}</span><span class="atype${cls}">${g.type}</span>
+        <span>${fmt(g.start)} → ${fmt(g.end)}</span>
+        <span>${smap} ↔ ${tmap}</span>
+        <span style="margin-left:auto">比例差 <b>${g.cost.length}</b>${g.cost.punct ? ` · 标点 <b>${g.cost.punct}</b>` : ""} · 合计 <b>${g.cost.total}</b></span></div>
+      <div class="apair">
+        <div class="aside src"><span class="idx">${escapeHtml(smap)} · 词 ${g.source.word_range[0]}–${g.source.word_range[1]}</span>${escapeHtml(g.source.text)}</div>
+        <div class="aside tgt"><span class="idx">${escapeHtml(tmap)}</span>${escapeHtml(g.target.text)}</div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function srtTime(t) {
+  const ms = Math.round(t * 1000);
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const msp = ms % 1000;
+  const p = x => String(x).padStart(2, "0");
+  return `${p(h)}:${p(m)}:${p(s)},${String(msp).padStart(3, "0")}`;
+}
+
+function buildBilingualSrt(data) {
+  // 每个对齐组一条字幕: 时间取首尾源段范围, 组内原文、译文各自合并为一行
+  return data.groups.map((g, i) =>
+    `${i + 1}\n${srtTime(g.start)} --> ${srtTime(g.end)}\n${g.source.text}\n${g.target.text}\n`
+  ).join("\n");
+}
+
+$("downloadSrt").addEventListener("click", () => {
+  if (!alignData) return;
+  const blob = new Blob([buildBilingualSrt(alignData)], { type: "text/srt;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "bilingual.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$("translation").addEventListener("input", scheduleAlign);
+$("fillTransExample").onclick = () => {
+  $("translation").value = TRANS_EXAMPLE;
+  scheduleAlign();
+};
+
+const TRANS_EXAMPLE = `Today we're going to look at
+a very important example.
+First, we need to understand the core idea of dynamic programming.`;
 
 function scheduleReview() {
   clearTimeout(reviewTimer);

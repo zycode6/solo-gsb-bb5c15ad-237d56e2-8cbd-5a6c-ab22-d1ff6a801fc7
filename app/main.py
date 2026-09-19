@@ -6,10 +6,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .alignment import align_translation
 from .segmenter import Config, solve
 from .terminology import TermError, review_terms
 
-app = FastAPI(title="字幕断句", version="1.4.0")
+app = FastAPI(title="字幕断句", version="1.5.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -64,6 +65,18 @@ class ReviewRequest(BaseModel):
     terms: list[TermIn] = Field(default_factory=list)
 
 
+class AlignSegmentIn(BaseModel):
+    """当前选中的断句方案中的一段: 词范围(对齐据此还原源段文本与时间)。"""
+    word_range: list[int] = Field(min_length=2, max_length=2)
+    line_break: int | None = None
+
+
+class AlignRequest(BaseModel):
+    words: list[WordIn]
+    segments: list[AlignSegmentIn] = Field(default_factory=list)
+    translation: str = ""
+
+
 @app.post("/api/segment")
 def segment(req: SegmentRequest):
     cfg_fields = {k: v for k, v in req.config.items() if k in Config.__dataclass_fields__}
@@ -87,6 +100,18 @@ def terms_review(req: ReviewRequest):
         )
     except TermError as e:
         raise HTTPException(status_code=422, detail=e.payload)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/align")
+def align(req: AlignRequest):
+    try:
+        return align_translation(
+            [w.model_dump() for w in req.words],
+            [s.model_dump() for s in req.segments],
+            req.translation,
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
